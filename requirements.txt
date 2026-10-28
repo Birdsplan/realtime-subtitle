@@ -1,9 +1,15 @@
-PyQt6
+PyQt6==6.7.1
+PyQt6-Qt6==6.7.3
+PyQt6-sip==13.8.0
 faster-whisper
 sounddevice
+soundcard
 numpy
 openai
 pyobjc-framework-CoreAudio; sys_platform == 'darwin'
 funasr
 modelscope
 watchdog
+# Required by the FunASR backend at runtime.
+torch
+torchaudio

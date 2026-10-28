@@ -3,16 +3,89 @@ import numpy as np
 import queue
 import threading
 import time
+from collections import deque
+
+
+class AudioBufferClosed(Exception):
+    pass
+
+
+class AudioChunkBuffer:
+    """Thread-safe bounded ring buffer that drops the oldest chunk on overflow."""
+
+    def __init__(self, max_chunks):
+        if max_chunks < 1:
+            raise ValueError("max_chunks must be at least 1")
+        self.max_chunks = max_chunks
+        self._chunks = deque()
+        self._condition = threading.Condition()
+        self._closed = False
+        self.pushed_chunks = 0
+        self.popped_chunks = 0
+        self.dropped_chunks = 0
+        self.high_watermark = 0
+
+    def put(self, chunk):
+        with self._condition:
+            if self._closed:
+                return False
+            dropped = False
+            if len(self._chunks) >= self.max_chunks:
+                self._chunks.popleft()
+                self.dropped_chunks += 1
+                dropped = True
+            self._chunks.append(chunk)
+            self.pushed_chunks += 1
+            self.high_watermark = max(self.high_watermark, len(self._chunks))
+            self._condition.notify()
+            return dropped
+
+    def get(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while not self._chunks:
+                if self._closed:
+                    raise AudioBufferClosed
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                self._condition.wait(remaining)
+
+            self.popped_chunks += 1
+            return self._chunks.popleft()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def stats(self):
+        with self._condition:
+            return {
+                "capacity": self.max_chunks,
+                "queued": len(self._chunks),
+                "pushed": self.pushed_chunks,
+                "popped": self.popped_chunks,
+                "dropped": self.dropped_chunks,
+                "high_watermark": self.high_watermark,
+                "closed": self._closed,
+            }
 
 class AudioCapture:
     def __init__(self, device_index=None, sample_rate=16000, chunk_duration=0.1, 
                  silence_threshold=0.01, silence_duration=1.0, max_phrase_duration=5.0,
-                 streaming_mode=False, streaming_interval=1.5, streaming_step_size=0.2, streaming_overlap=0.3):
+                 streaming_mode=False, streaming_interval=1.5, streaming_step_size=0.2, streaming_overlap=0.3,
+                 input_mode="microphone", loopback_index=None, capture_buffer_seconds=8.0):
         """
         Captures audio and yields segments containing speech.
         
         Args:
+            input_mode: "microphone" for sounddevice input, or "system" for system-audio loopback.
             device_index: Index of input device (None for default).
+            loopback_index: Index from soundcard loopback device list, or None for default speaker.
             sample_rate: Audio sample rate (default 16000 for Whisper).
             chunk_duration: Duration of each small read in seconds.
             silence_threshold: RMS amplitude threshold for "silence".
@@ -21,8 +94,11 @@ class AudioCapture:
             streaming_mode: If True, emit audio at fixed intervals (no VAD).
             streaming_interval: Seconds between audio emissions in streaming mode.
             streaming_overlap: Seconds of overlap between chunks in streaming mode.
+            capture_buffer_seconds: Maximum raw audio buffered between capture and processing.
         """
+        self.input_mode = (input_mode or "microphone").lower()
         self.device_index = device_index
+        self.loopback_index = loopback_index
         self.sample_rate = sample_rate
         self.block_size = int(sample_rate * chunk_duration)
         self.silence_threshold = silence_threshold
@@ -32,14 +108,18 @@ class AudioCapture:
         # Streaming mode settings
         self.streaming_mode = streaming_mode
         self.streaming_interval = streaming_interval
-        self.streaming_mode = streaming_mode
-        self.streaming_interval = streaming_interval
         self.streaming_step_size = streaming_step_size
         self.streaming_overlap = streaming_overlap
+        self.capture_buffer_seconds = max(streaming_step_size, capture_buffer_seconds)
         
         self.audio_queue = queue.Queue()
         self.running = False
         self.thread = None
+        self.capture_thread = None
+        self.capture_buffer = None
+        self.capture_error = None
+        self._last_buffer_warning = 0.0
+        self._capture_stats_logged = False
 
     def start(self):
         self.running = True
@@ -48,6 +128,7 @@ class AudioCapture:
         
         # Log audio device info
         print("[AudioCapture] Starting...")
+        print(f"  Input Mode: {self.input_mode}")
         print(f"  Sample Rate: {self.sample_rate} Hz")
         print(f"  Silence Threshold: {self.silence_threshold}")
         print(f"  Silence Duration: {self.silence_duration}s")
@@ -74,12 +155,93 @@ class AudioCapture:
 
     def stop(self):
         self.running = False
-        if self.thread:
-            self.thread.join()
+        if self.capture_buffer:
+            self.capture_buffer.close()
+        if self.capture_thread and self.capture_thread is not threading.current_thread():
+            self.capture_thread.join(timeout=2)
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=2)
+        self._log_capture_stats()
         print("Audio capture stopped.")
 
     def generator(self):
-        """Yields small raw audio chunks for external accumulation logic."""
+        """Yield raw chunks while a dedicated worker continuously reads the audio device."""
+        if self.capture_thread and self.capture_thread.is_alive():
+            raise RuntimeError("Audio capture generator is already running")
+
+        step_size = max(0.01, self.streaming_step_size)
+        capacity = max(2, int(np.ceil(self.capture_buffer_seconds / step_size)))
+        self.capture_buffer = AudioChunkBuffer(capacity)
+        self.capture_error = None
+        self._capture_stats_logged = False
+        self.running = True
+        self.capture_thread = threading.Thread(
+            target=self._capture_worker,
+            name="audio-capture-worker",
+            daemon=True,
+        )
+        self.capture_thread.start()
+        print(
+            f"[Audio] Capture worker started "
+            f"(buffer={self.capture_buffer_seconds:.1f}s, capacity={capacity} chunks)"
+        )
+
+        try:
+            while True:
+                try:
+                    yield self.capture_buffer.get(timeout=0.5)
+                except queue.Empty:
+                    if not self.capture_thread.is_alive():
+                        break
+                except AudioBufferClosed:
+                    break
+        finally:
+            self.running = False
+            self.capture_buffer.close()
+            if self.capture_thread is not threading.current_thread():
+                self.capture_thread.join(timeout=2)
+            self._log_capture_stats()
+
+        if self.capture_error:
+            raise RuntimeError(f"Audio capture worker failed: {self.capture_error}") from self.capture_error
+
+    def _capture_worker(self):
+        source = (
+            self._system_loopback_generator
+            if self.input_mode in ("system", "system_audio", "loopback")
+            else self._microphone_generator
+        )
+        try:
+            for chunk in source():
+                if not self.running:
+                    break
+                dropped = self.capture_buffer.put(chunk)
+                if dropped and time.monotonic() - self._last_buffer_warning > 3.0:
+                    stats = self.capture_buffer.stats()
+                    print(
+                        "[Audio] Capture buffer overflow; dropped oldest chunk "
+                        f"(dropped={stats['dropped']}, queued={stats['queued']}/{stats['capacity']})"
+                    )
+                    self._last_buffer_warning = time.monotonic()
+        except Exception as e:
+            self.capture_error = e
+            print(f"[Audio] Capture worker error: {e}")
+        finally:
+            self.capture_buffer.close()
+
+    def _log_capture_stats(self):
+        if not self.capture_buffer or self._capture_stats_logged:
+            return
+        stats = self.capture_buffer.stats()
+        print(
+            "[Audio] Capture buffer stats: "
+            f"pushed={stats['pushed']}, popped={stats['popped']}, "
+            f"dropped={stats['dropped']}, high_watermark={stats['high_watermark']}/{stats['capacity']}"
+        )
+        self._capture_stats_logged = True
+
+    def _microphone_generator(self):
+        """Yield mono microphone chunks from sounddevice."""
         if self.device_index is None:
              # Just safety check, usually handled in start()
              pass
@@ -108,6 +270,75 @@ class AudioCapture:
             yield np.zeros(block_size, dtype=np.float32)
             
         print("[Audio] Generator stopped.")
+
+    def _system_loopback_generator(self):
+        """Yield mono system-audio chunks from the default speaker loopback."""
+        block_size = int(self.sample_rate * self.streaming_step_size)
+        print(f"[Audio] Starting system loopback stream (step={self.streaming_step_size}s)")
+
+        try:
+            import soundcard as sc
+            import warnings
+
+            try:
+                from soundcard.mediafoundation import SoundcardRuntimeWarning
+                warnings.filterwarnings(
+                    "once",
+                    message="data discontinuity in recording",
+                    category=SoundcardRuntimeWarning,
+                )
+            except Exception:
+                warnings.filterwarnings("once", message="data discontinuity in recording")
+
+            loopbacks = [
+                device for device in sc.all_microphones(include_loopback=True)
+                if getattr(device, "isloopback", False)
+            ]
+            if not loopbacks:
+                raise RuntimeError("No system-audio loopback devices found")
+
+            loopback = self._select_loopback_device(sc, loopbacks)
+            print(f"[Audio] Using system loopback: {loopback}")
+            print(f"[Audio] Sample Rate: {self.sample_rate} Hz")
+
+            with loopback.recorder(samplerate=self.sample_rate) as recorder:
+                self.running = True
+                while self.running:
+                    data = recorder.record(numframes=block_size)
+                    if data is None or data.size == 0:
+                        yield np.zeros(block_size, dtype=np.float32)
+                        continue
+
+                    if data.ndim > 1:
+                        data = data.mean(axis=1)
+
+                    yield data.astype(np.float32, copy=False)
+
+        except Exception as e:
+            print(f"\n[ERROR] System Audio Loopback Initialization Failed: {e}")
+            print("Possible causes:")
+            print("1. No active Windows speaker output device is available")
+            print("2. The selected loopback index is invalid")
+            print("3. The 'soundcard' package is missing or cannot access WASAPI loopback")
+            self.running = False
+            yield np.zeros(block_size, dtype=np.float32)
+
+        print("[Audio] System loopback generator stopped.")
+
+    def _select_loopback_device(self, sc, loopbacks):
+        if self.loopback_index is not None:
+            if 0 <= self.loopback_index < len(loopbacks):
+                return loopbacks[self.loopback_index]
+            raise RuntimeError(
+                f"Invalid loopback_index={self.loopback_index}; available range is 0-{len(loopbacks) - 1}"
+            )
+
+        default_speaker = sc.default_speaker()
+        for loopback in loopbacks:
+            if loopback.name == default_speaker.name:
+                return loopback
+
+        return loopbacks[0]
 
     def get_audio_stream(self):
         """Generator that yields numpy arrays of float32 audio containing speech."""

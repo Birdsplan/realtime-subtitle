@@ -30,7 +30,10 @@ class Transcriber:
         """Initialize faster-whisper backend"""
         from faster_whisper import WhisperModel
         self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        print(f"[Transcriber] Using faster-whisper (CPU/CUDA) with model: {model_size}")
+        print(
+            "[Transcriber] Using faster-whisper "
+            f"with model={model_size}, device={device}, compute_type={compute_type}"
+        )
     
     def _init_mlx(self, model_size):
         sssss

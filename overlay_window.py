@@ -1,9 +1,11 @@
 from PyQt6.QtWidgets import (QApplication, QWidget, QTextEdit, QVBoxLayout, QGraphicsDropShadowEffect, 
                              QSizeGrip, QHBoxLayout, QScrollArea, QLabel, QFrame)
-from PyQt6.QtCore import Qt, QPoint, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtCore import Qt, QEvent, QPoint, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QColor, QPalette, QCursor
 
 from ctypes import c_void_p
+import configparser
+import os
 import time
 
 # macOS: Make window visible on all desktops (Spaces)
@@ -14,84 +16,150 @@ try:
 except ImportError:
     HAS_APPKIT = False
 
+
+def calculate_overlay_geometry(
+    screen_x,
+    screen_y,
+    screen_width,
+    screen_height,
+    requested_width,
+    requested_height,
+    bottom_margin,
+    position="bottom_center",
+):
+    available_width = max(1, screen_width - 40)
+    available_height = max(1, screen_height - 40)
+    minimum_width = min(480, available_width)
+    minimum_height = min(220, available_height)
+    width = min(max(requested_width, minimum_width), available_width)
+    height = min(max(requested_height, minimum_height), available_height)
+    horizontal_margin = 20
+    if position == "bottom_left":
+        x = screen_x + horizontal_margin
+    elif position == "bottom_right":
+        x = screen_x + screen_width - width - horizontal_margin
+    else:
+        x = screen_x + (screen_width - width) // 2
+    y = screen_y + screen_height - height - max(0, bottom_margin)
+    y = max(screen_y + 20, y)
+    return x, y, width, height
+
+
+def should_show_translation(text):
+    return bool(text) and text != "(translating...)"
+
+
+# Width in pixels of the resize zone along every window edge. The outer 12 px
+# of the window is fully transparent and does not reliably receive mouse
+# events on Windows, so the zone must extend past it onto the visible panel.
+RESIZE_MARGIN = 20
+
+
+def detect_resize_edges(x, y, width, height, margin=RESIZE_MARGIN):
+    """Return the set of window edges the point (x, y) is close to.
+
+    Possible members: "left", "right", "top", "bottom". A corner returns
+    two members (e.g. {"right", "bottom"}); the interior returns an empty set.
+    """
+    edges = set()
+    if x <= margin:
+        edges.add("left")
+    elif x >= width - margin:
+        edges.add("right")
+    if y <= margin:
+        edges.add("top")
+    elif y >= height - margin:
+        edges.add("bottom")
+    return edges
+
+
+def persist_window_size(config_path, width, height):
+    """Write the user-chosen overlay size back to config.ini [display]."""
+    parser = configparser.ConfigParser()
+    parser.read(config_path)
+    if not parser.has_section("display"):
+        parser.add_section("display")
+    parser.set("display", "window_width", str(int(width)))
+    parser.set("display", "window_height", str(int(height)))
+    with open(config_path, "w") as f:
+        parser.write(f)
+
+
 class LogItem(QFrame):
     """A widget representing a single chunk of transcription/translation"""
-    def __init__(self, chunk_id, timestamp, original_text, translated_text=""):
+    def __init__(
+        self,
+        chunk_id,
+        timestamp,
+        original_text,
+        translated_text="",
+        original_font_size=16,
+        translation_font_size=24,
+    ):
         super().__init__()
         self.chunk_id = chunk_id
+        self.timestamp = timestamp
+        self.original_font_size = original_font_size
+        self.translation_font_size = translation_font_size
         
         # Style
         self.setStyleSheet("background-color: transparent;")
         self.layout = QVBoxLayout()
-        self.layout.setContentsMargins(0, 0, 0, 15) # Bottom margin
-        self.layout.setSpacing(2)
+        self.layout.setContentsMargins(0, 0, 0, 20)
+        self.layout.setSpacing(6)
         self.setLayout(self.layout)
         
         # Original Text Label
         self.original_label = QLabel(f"[{timestamp}] {original_text}")
         self.original_label.setWordWrap(True)
-        self.original_label.setStyleSheet("color: #aaaaaa; font-family: Arial; font-size: 14px;")
+        self.original_label.setStyleSheet(
+            "color: rgba(242, 245, 255, 210); font-family: 'Segoe UI', Arial; "
+            f"font-size: {self.original_font_size}px; font-weight: 500;"
+        )
         self.layout.addWidget(self.original_label)
         
         # Translated Text Label
-        self.translated_label = QLabel(translated_text if translated_text else "...")
+        self.translated_label = QLabel("")
         self.translated_label.setWordWrap(True)
-        self.translated_label.setStyleSheet("color: #ffffff; font-family: Arial; font-size: 20px; font-weight: bold;")
         self.layout.addWidget(self.translated_label)
+        self.update_translated(translated_text)
         
     def update_translated(self, text):
-        self.translated_label.setText(text)
+        # Pending translation stays hidden so stable source text can lead visually.
+        has_text = should_show_translation(text)
+        self.translated_label.setVisible(has_text)
+        if not has_text:
+            self.translated_label.setText("")
+            return
+
+        if text == "[Translation Failed]":
+            self.translated_label.setStyleSheet(
+                "color: #ffb4ab; font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial; "
+                f"font-size: {max(16, self.translation_font_size - 4)}px; font-weight: 700;"
+            )
+            self.translated_label.setText(text)
+        else:
+            self.translated_label.setStyleSheet(
+                "color: #ffffff; font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial; "
+                f"font-size: {self.translation_font_size}px; "
+                "font-weight: 700; line-height: 132%;"
+            )
+            self.translated_label.setText(text)
 
     def update_original(self, text):
-        self.original_label.setText(f"[{time.strftime('%H:%M:%S')}] {text}")
+        self.original_label.setText(f"[{self.timestamp}] {text}")
 
-class OverlayWindow(QWidget):
-    def __init__(self, display_duration=None, window_width=400, window_height=None):
-        super().__init__()
-        # display_duration is not really used in log mode, but kept for compatibility
-        self.window_width = window_width
-        
-        # Default height to full screen height if not specified
-        screen_geometry = QApplication.primaryScreen().availableGeometry()
-        self.window_height = window_height if window_height else screen_geometry.height()
-        
-        self.initUI()
-        self.oldPos = self.pos()
-
-    def showEvent(self, event):
-        """Called when window is shown - set all-spaces behavior here"""
-        super().showEvent(event)
-        if HAS_APPKIT:
-            self._set_all_spaces()
-    
-    def _set_all_spaces(self):
-        """Make window appear on all macOS Spaces/Desktops"""
-        try:
-            # Get the native NSWindow from Qt's winId
-            win_id = int(self.winId())
-            ns_view = objc.objc_object(c_void_p=c_void_p(win_id))
-            ns_window = ns_view.window()
-            ns_window.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary
-            )
-            print("Window set to appear on all Spaces")
-        except Exception as e:
-            print(f"Could not set all-spaces behavior: {e}")
-
-    def initUI(self):
-        # Window flags for transparency and staying on top
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | 
-            Qt.WindowType.WindowStaysOnTopHint | 
-            Qt.WindowType.WindowDoesNotAcceptFocus
-        )
 class ResizeHandle(QLabel):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent_window = parent
         self.setText("◢")
-        self.setStyleSheet("color: rgba(255, 255, 255, 100); font-size: 16px;")
-        self.setFixedSize(20, 20)
+        self.setToolTip("Drag to resize (any window edge works too)")
+        self.setStyleSheet(
+            "QLabel { color: rgba(255, 255, 255, 150); font-size: 16px; }"
+            "QLabel:hover { color: rgba(255, 255, 255, 240); }"
+        )
+        self.setFixedSize(24, 24)
         self.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
         self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         
@@ -113,19 +181,38 @@ class ResizeHandle(QLabel):
             event.accept()
             
     def mouseReleaseEvent(self, event):
-        self.startPos = None
+        if self.startPos is not None:
+            self.startPos = None
+            self.parent_window._on_user_resized()
 
 class OverlayWindow(QWidget):
     stop_requested = pyqtSignal()
+    size_persisted = pyqtSignal(int, int)
 
-    def __init__(self, display_duration=None, window_width=400, window_height=None):
+    def __init__(
+        self,
+        display_duration=None,
+        window_width=1000,
+        window_height=320,
+        max_visible_items=3,
+        bottom_margin=48,
+        position="bottom_center",
+        original_font_size=16,
+        translation_font_size=24,
+        panel_opacity=118,
+        auto_hide_controls=True,
+    ):
         super().__init__()
         # display_duration is not really used in log mode, but kept for compatibility
         self.window_width = window_width
-        
-        # Default height to full screen height if not specified
-        screen_geometry = QApplication.primaryScreen().availableGeometry()
-        self.window_height = window_height if window_height else screen_geometry.height()
+        self.window_height = window_height
+        self.max_visible_items = max_visible_items
+        self.bottom_margin = max(0, bottom_margin)
+        self.position = position
+        self.original_font_size = max(10, original_font_size)
+        self.translation_font_size = max(12, translation_font_size)
+        self.panel_opacity = min(max(panel_opacity, 35), 230)
+        self.auto_hide_controls = auto_hide_controls
         
         self.initUI()
         self.oldPos = self.pos()
@@ -162,7 +249,7 @@ class OverlayWindow(QWidget):
         
         # Layout
         layout = QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(12, 12, 12, 10)
         self.setLayout(layout)
         
         # SCROLL AREA
@@ -179,9 +266,22 @@ class OverlayWindow(QWidget):
         
         # Container for LogItems
         self.container = QFrame()
-        self.container.setStyleSheet("background-color: rgba(0, 0, 0, 150); border-radius: 10px;")
+        self.container.setObjectName("subtitlePanel")
+        self.container.setStyleSheet(f"""
+            QFrame#subtitlePanel {{
+                background-color: rgba(8, 10, 14, {self.panel_opacity});
+                border: 1px solid rgba(255, 255, 255, 34);
+                border-radius: 8px;
+            }}
+        """)
+        shadow = QGraphicsDropShadowEffect(self.container)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(0, 0, 0, 105))
+        self.container.setGraphicsEffect(shadow)
         self.container_layout = QVBoxLayout()
-        self.container_layout.setContentsMargins(10, 10, 10, 10)
+        self.container_layout.setContentsMargins(14, 12, 14, 12)
+        self.container_layout.setSpacing(0)
         # Allocate alignment to top so items stack from top
         self.container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.container.setLayout(self.container_layout)
@@ -189,24 +289,30 @@ class OverlayWindow(QWidget):
         self.scroll_area.setWidget(self.container)
         layout.addWidget(self.scroll_area)
         
-        # Bottom Control Bar (Resize Grip + Save Button)
-        grip_layout = QHBoxLayout()
+        # Bottom control bar keeps a fixed footprint so hover does not shift subtitles.
+        self.control_bar = QFrame()
+        self.control_bar.setFixedHeight(34)
+        self.control_bar.setStyleSheet("background: transparent; border: none;")
+        grip_layout = QHBoxLayout(self.control_bar)
+        grip_layout.setContentsMargins(0, 0, 0, 0)
+        grip_layout.setSpacing(8)
         
         # Save Button
-        from PyQt6.QtWidgets import QPushButton, QStyle 
+        from PyQt6.QtWidgets import QPushButton
         self.save_btn = QPushButton("💾 Save")
+        self.save_btn.setToolTip("Save the transcript shown so far to the transcripts folder")
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.setFixedWidth(80)
         self.save_btn.setStyleSheet("""
             QPushButton {
-                background-color: rgba(255, 255, 255, 50);
+                background-color: rgba(10, 12, 16, 95);
                 color: white;
-                border-radius: 5px;
+                border-radius: 6px;
                 padding: 5px;
-                border: none;
+                border: 1px solid rgba(255, 255, 255, 40);
             }
             QPushButton:hover {
-                background-color: rgba(255, 255, 255, 100);
+                background-color: rgba(255, 255, 255, 72);
             }
         """)
         self.save_btn.clicked.connect(self._save_transcript)
@@ -220,10 +326,10 @@ class OverlayWindow(QWidget):
         self.stop_btn.setFixedSize(30, 30)
         self.stop_btn.setStyleSheet("""
             QPushButton {
-                background-color: rgba(243, 139, 168, 150);
+                background-color: rgba(243, 139, 168, 120);
                 color: white;
                 border-radius: 15px;
-                border: none;
+                border: 1px solid rgba(255, 255, 255, 35);
                 font-size: 14px;
             }
             QPushButton:hover {
@@ -239,15 +345,38 @@ class OverlayWindow(QWidget):
         self.grip_label = ResizeHandle(self)
         grip_layout.addWidget(self.grip_label)
         
-        layout.addLayout(grip_layout)
+        layout.addWidget(self.control_bar)
+
+        # The resize grip stays visible at all times so the resize affordance
+        # is discoverable; only the buttons participate in auto-hide.
+        self._control_widgets = [self.save_btn, self.stop_btn]
+        self._controls_hide_timer = QTimer(self)
+        self._controls_hide_timer.setSingleShot(True)
+        self._controls_hide_timer.timeout.connect(self._hide_controls)
+        if self.auto_hide_controls:
+            self._hide_controls()
         
-        # Set initial window size
-        self.resize(self.window_width, self.window_height)
-        
-        # Position: Right side of screen, full height
+        # Keep the subtitle surface inside the usable desktop area.
         screen = QApplication.primaryScreen().availableGeometry()
-        x = screen.x() + screen.width() - self.window_width - 20 # 20px padding from right
-        y = screen.y()
+        x, y, width, height = calculate_overlay_geometry(
+            screen.x(),
+            screen.y(),
+            screen.width(),
+            screen.height(),
+            self.window_width,
+            self.window_height,
+            self.bottom_margin,
+            self.position,
+        )
+        # Same floor as calculate_overlay_geometry, so edge/grip resizing
+        # cannot shrink the window below a usable size.
+        self.setMinimumSize(
+            min(480, max(1, screen.width() - 40)),
+            min(220, max(1, screen.height() - 40)),
+        )
+        self.resize(width, height)
+
+        # Position: centered horizontally and raised slightly above the taskbar.
         self.move(x, y)
         
         # Data storage: list of (chunk_id, widget) inclusive
@@ -258,9 +387,24 @@ class OverlayWindow(QWidget):
         
         # State
         self.is_moving = False
-        
+        self._resize_edges = set()
+        self._resize_start_geometry = None
+        self._resize_start_pos = None
+
         # Enable mouse tracking for cursor update without click
         self.setMouseTracking(True)
+        # Hover moves over these children must reach the window too, or the
+        # resize cursor would never appear over the visible panel edges.
+        for child in (self.scroll_area.viewport(), self.container, self.control_bar):
+            child.setMouseTracking(True)
+            child.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseMove and not event.buttons():
+            pos = self.mapFromGlobal(event.globalPosition().toPoint())
+            edges = detect_resize_edges(pos.x(), pos.y(), self.width(), self.height())
+            self.setCursor(self._cursor_for_edges(edges))
+        return super().eventFilter(obj, event)
 
     def update_text(self, chunk_id, original_text, translated_text):
         """Append new text or update existing text"""
@@ -274,6 +418,8 @@ class OverlayWindow(QWidget):
                 'translated': translated_text
             }
         else:
+            if original_text:
+                self.transcript_data[chunk_id]['original'] = original_text
             if translated_text:
                 self.transcript_data[chunk_id]['translated'] = translated_text
         
@@ -296,7 +442,14 @@ class OverlayWindow(QWidget):
         else:
             # Insert new widget in order
             timestamp = self.transcript_data[chunk_id]['timestamp']
-            new_widget = LogItem(chunk_id, timestamp, original_text, translated_text)
+            new_widget = LogItem(
+                chunk_id,
+                timestamp,
+                original_text,
+                translated_text,
+                original_font_size=self.original_font_size,
+                translation_font_size=self.translation_font_size,
+            )
             
             # Find insertion point
             insert_idx = len(self.items)
@@ -311,10 +464,18 @@ class OverlayWindow(QWidget):
             
             # Scroll to bottom
             QTimer.singleShot(10, self._scroll_to_bottom)
+            self._trim_visible_items()
 
     def _scroll_to_bottom(self):
         sb = self.scroll_area.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _trim_visible_items(self):
+        while len(self.items) > self.max_visible_items:
+            old_chunk_id, old_widget = self.items.pop(0)
+            self.container_layout.removeWidget(old_widget)
+            old_widget.deleteLater()
+            print(f"[Overlay] Hid old widget #{old_chunk_id}")
 
     def _save_transcript(self):
         """Save history to file"""
@@ -346,27 +507,115 @@ class OverlayWindow(QWidget):
         except Exception as e:
             print(f"[Overlay] Error saving transcript: {e}")
 
+    def _show_controls(self):
+        self._controls_hide_timer.stop()
+        for widget in self._control_widgets:
+            widget.show()
+
+    def _hide_controls(self):
+        if not self.auto_hide_controls:
+            return
+        cursor_position = self.mapFromGlobal(QCursor.pos())
+        if self.isVisible() and self.rect().contains(cursor_position):
+            return
+        for widget in self._control_widgets:
+            widget.hide()
+
+    def enterEvent(self, event):
+        if self.auto_hide_controls:
+            self._show_controls()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.auto_hide_controls:
+            self._controls_hide_timer.start(350)
+        super().leaveEvent(event)
 
 
-    # Window Moving Logic (Resize is handled by ResizeHandle widget)
+
+    # Window moving and edge resizing logic. A press near any window edge
+    # starts a resize; a press anywhere else starts a move.
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.is_moving = True
-            self.oldPos = event.globalPosition().toPoint()
+            pos = event.position().toPoint()
+            edges = detect_resize_edges(pos.x(), pos.y(), self.width(), self.height())
+            if edges:
+                self._resize_edges = edges
+                self._resize_start_geometry = self.geometry()
+                self._resize_start_pos = event.globalPosition().toPoint()
+            else:
+                self.is_moving = True
+                self.oldPos = event.globalPosition().toPoint()
 
     def mouseMoveEvent(self, event):
-        # Update cursor shape based on position (reset to arrow)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        
-        # Handle dragging
+        if self._resize_edges:
+            self._apply_edge_resize(event.globalPosition().toPoint())
+            return
+
         if self.is_moving:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             delta = event.globalPosition().toPoint() - self.oldPos
             self.move(self.x() + delta.x(), self.y() + delta.y())
             self.oldPos = event.globalPosition().toPoint()
-            
+            return
+
+        # Hover: show a resize cursor near edges so resizing is discoverable.
+        pos = event.position().toPoint()
+        edges = detect_resize_edges(pos.x(), pos.y(), self.width(), self.height())
+        self.setCursor(self._cursor_for_edges(edges))
+
     def mouseReleaseEvent(self, event):
+        was_resizing = bool(self._resize_edges)
+        self._resize_edges = set()
+        self._resize_start_geometry = None
+        self._resize_start_pos = None
         self.is_moving = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        if was_resizing:
+            self._on_user_resized()
+
+    @staticmethod
+    def _cursor_for_edges(edges):
+        if edges in ({"left"}, {"right"}):
+            return Qt.CursorShape.SizeHorCursor
+        if edges in ({"top"}, {"bottom"}):
+            return Qt.CursorShape.SizeVerCursor
+        if edges in ({"left", "top"}, {"right", "bottom"}):
+            return Qt.CursorShape.SizeFDiagCursor
+        if edges in ({"left", "bottom"}, {"right", "top"}):
+            return Qt.CursorShape.SizeBDiagCursor
+        return Qt.CursorShape.ArrowCursor
+
+    def _apply_edge_resize(self, global_pos):
+        delta = global_pos - self._resize_start_pos
+        geo = self._resize_start_geometry
+        x, y, width, height = geo.x(), geo.y(), geo.width(), geo.height()
+        # Dragging the left or top edge moves that edge and keeps the
+        # opposite edge anchored, like a normal window.
+        if "right" in self._resize_edges:
+            width = max(self.minimumWidth(), geo.width() + delta.x())
+        elif "left" in self._resize_edges:
+            width = max(self.minimumWidth(), geo.width() - delta.x())
+            x = geo.x() + geo.width() - width
+        if "bottom" in self._resize_edges:
+            height = max(self.minimumHeight(), geo.height() + delta.y())
+        elif "top" in self._resize_edges:
+            height = max(self.minimumHeight(), geo.height() - delta.y())
+            y = geo.y() + geo.height() - height
+        self.setGeometry(x, y, width, height)
+
+    def _on_user_resized(self):
+        """Remember the size the user dragged to, for this run and the next."""
+        self.window_width = self.width()
+        self.window_height = self.height()
+        config_path = os.path.join(os.path.dirname(__file__), "config.ini")
+        try:
+            persist_window_size(config_path, self.window_width, self.window_height)
+            print(f"[Overlay] Saved window size {self.window_width}x{self.window_height} to config.ini")
+        except Exception as e:
+            print(f"[Overlay] Could not save window size: {e}")
+            return
+        self.size_persisted.emit(self.window_width, self.window_height)
 
 if __name__ == "__main__":
     import sys

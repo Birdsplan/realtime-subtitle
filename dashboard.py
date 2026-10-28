@@ -2,10 +2,12 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QFrame, QComboBox, QLineEdit, 
                              QTabWidget, QSpinBox, QDoubleSpinBox, QGridLayout,
                              QScrollArea, QSizePolicy, QSpacerItem, QFormLayout, QApplication,
-                             QMessageBox, QTextEdit, QDialog)
+                             QMessageBox, QTextEdit, QDialog, QSlider, QCheckBox,
+                             QSystemTrayIcon, QMenu, QStyle)
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QThread
-from PyQt6.QtGui import QFont, QIcon, QColor
+from PyQt6.QtGui import QFont, QIcon, QColor, QAction
 import sys
+import os
 import sounddevice as sd
 from config import config
 
@@ -45,6 +47,44 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     color: #cdd6f4;
     selection-background-color: #585b70;
 }
+QSpinBox, QDoubleSpinBox {
+    padding-right: 28px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 26px;
+    border-left: 1px solid #1e1e2e;
+    border-bottom: 1px solid #1e1e2e;
+    border-top-right-radius: 4px;
+    background-color: #45475a;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 26px;
+    border-left: 1px solid #1e1e2e;
+    border-bottom-right-radius: 4px;
+    background-color: #45475a;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #585b70;
+}
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed,
+QDoubleSpinBox::up-button:pressed, QDoubleSpinBox::down-button:pressed {
+    background-color: #6c7086;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url(@ASSETS@/arrow_up.png);
+    width: 10px;
+    height: 7px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url(@ASSETS@/arrow_down.png);
+    width: 10px;
+    height: 7px;
+}
 QPushButton {
     background-color: #89b4fa;
     color: #1e1e2e;
@@ -81,18 +121,38 @@ class Dashboard(QWidget):
     stop_requested = pyqtSignal()
 
     def closeEvent(self, event):
-        """Ensure total program quit when dashboard is closed"""
-        self.status_label.setText("Stopping...")
-        self.on_stop()
-        # Force application exit
-        QApplication.quit()
-        event.accept()
+        """Hide to the system tray unless an explicit exit was requested."""
+        if self._force_quit or self.tray_icon is None:
+            self._stop_pipeline(show_dashboard=False)
+            event.accept()
+            QApplication.quit()
+            return
+
+        event.ignore()
+        self.hide()
+        if not self._tray_notice_shown:
+            self.tray_icon.showMessage(
+                "Realtime Subtitle",
+                "The app is still running in the system tray.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+            self._tray_notice_shown = True
 
     def __init__(self):
         super().__init__()
+        self.pipeline = None
+        self.overlay_window = None
+        self.tray_icon = None
+        self._startup_in_progress = False
+        self._quit_when_ready = False
+        self._force_quit = False
+        self._tray_notice_shown = False
         self.setWindowTitle("Real-Time Translator - Control Center")
         self.setMinimumSize(600, 500)
-        self.setStyleSheet(STYLESHEET)
+        # QSS url() paths need forward slashes, even on Windows.
+        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets").replace("\\", "/")
+        self.setStyleSheet(STYLESHEET.replace("@ASSETS@", assets_dir))
         
         # Main Layout
         self.layout = QVBoxLayout()
@@ -114,6 +174,7 @@ class Dashboard(QWidget):
         self.init_device_manager_tab()
         self.init_transcription_tab()
         self.init_translation_tab()
+        self.init_display_tab()
         
         # Footer Actions
         footer = QHBoxLayout()
@@ -126,6 +187,93 @@ class Dashboard(QWidget):
         footer.addWidget(self.save_btn)
         self.layout.addLayout(footer)
 
+        self.init_system_tray()
+
+    def init_system_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        app = QApplication.instance()
+        if app:
+            app.setQuitOnLastWindowClosed(False)
+
+        style = QApplication.style()
+        try:
+            tray_icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+        except AttributeError:
+            tray_icon = style.standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+        self.setWindowIcon(tray_icon)
+        self.tray_icon = QSystemTrayIcon(tray_icon, self)
+        self.tray_icon.setToolTip("Realtime Subtitle - Ready")
+
+        tray_menu = QMenu(self)
+        self.tray_open_action = QAction("Open Dashboard", self)
+        self.tray_start_action = QAction("Start Translator", self)
+        self.tray_stop_action = QAction("Stop Translator", self)
+        self.tray_exit_action = QAction("Exit", self)
+
+        self.tray_open_action.triggered.connect(self.show_dashboard)
+        self.tray_start_action.triggered.connect(self.start_from_tray)
+        self.tray_stop_action.triggered.connect(self.stop_from_tray)
+        self.tray_exit_action.triggered.connect(self.exit_application)
+
+        tray_menu.addAction(self.tray_open_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(self.tray_start_action)
+        tray_menu.addAction(self.tray_stop_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(self.tray_exit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+        self._update_tray_actions(running=False, loading=False)
+
+    def _on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_dashboard()
+
+    def _update_tray_actions(self, running, loading):
+        if self.tray_icon is None:
+            return
+        self.tray_start_action.setEnabled(not running and not loading)
+        self.tray_stop_action.setEnabled(running)
+        self.tray_open_action.setEnabled(True)
+        state = "Starting" if loading else "Running" if running else "Ready"
+        self.tray_icon.setToolTip(f"Realtime Subtitle - {state}")
+
+    def show_dashboard(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def start_from_tray(self):
+        if self.pipeline is None and not self._startup_in_progress:
+            self.on_start()
+
+    def stop_from_tray(self):
+        self._stop_pipeline(show_dashboard=False)
+
+    def exit_application(self):
+        if self._startup_in_progress:
+            self._quit_when_ready = True
+            self.hide()
+            if self.tray_icon:
+                self.tray_icon.setToolTip("Realtime Subtitle - Exiting")
+            return
+        self._final_exit()
+
+    def _final_exit(self):
+        self._force_quit = True
+        self._stop_pipeline(show_dashboard=False)
+        if self.tray_icon:
+            self.tray_icon.hide()
+        QApplication.quit()
+
     def init_home_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
@@ -135,6 +283,10 @@ class Dashboard(QWidget):
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("font-size: 18px; color: #a6e3a1;")
         layout.addWidget(self.status_label)
+
+        self.runtime_detail_label = QLabel("Idle")
+        self.runtime_detail_label.setStyleSheet("font-size: 13px; color: #a6adc8;")
+        layout.addWidget(self.runtime_detail_label)
         
         btn_layout = QHBoxLayout()
         
@@ -160,45 +312,87 @@ class Dashboard(QWidget):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "🏠 Home")
 
+    def set_runtime_status(self, level, message):
+        colors = {
+            "ready": "#a6e3a1",
+            "running": "#a6e3a1",
+            "transcribing": "#89b4fa",
+            "translating": "#fab387",
+            "stopping": "#fab387",
+            "stopped": "#a6adc8",
+            "error": "#f38ba8",
+        }
+        color = colors.get(level, "#a6adc8")
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(f"font-size: 18px; color: {color};")
+        self.runtime_detail_label.setText(f"Status: {level}")
+
     def init_audio_tab(self):
         tab = QWidget()
         layout = QGridLayout() # Use Grid for organized form
         layout.setSpacing(15)
         
+        # Input Mode
+        layout.addWidget(QLabel("Input Mode:"), 0, 0)
+        self.input_mode = QComboBox()
+        self.input_mode.addItem("Microphone", "microphone")
+        self.input_mode.addItem("System Audio", "system")
+        mode_index = self.input_mode.findData(config.audio_input_mode)
+        self.input_mode.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self.input_mode.currentIndexChanged.connect(self._on_input_mode_changed)
+        layout.addWidget(self.input_mode, 0, 1)
+
         # Device Selection
-        layout.addWidget(QLabel("Input Device:"), 0, 0)
+        layout.addWidget(QLabel("Input Device:"), 1, 0)
         self.device_combo = QComboBox()
-        self.populate_devices()
-        layout.addWidget(self.device_combo, 0, 1)
+        layout.addWidget(self.device_combo, 1, 1)
         
         # Refresh Button
         refresh_btn = QPushButton("🔄")
         refresh_btn.setFixedWidth(40)
-        refresh_btn.clicked.connect(self.populate_devices)
-        layout.addWidget(refresh_btn, 0, 2)
+        refresh_btn.clicked.connect(self.refresh_audio_inputs)
+        layout.addWidget(refresh_btn, 1, 2)
+        
+        # System Loopback Selection
+        layout.addWidget(QLabel("System Loopback:"), 2, 0)
+        self.loopback_combo = QComboBox()
+        layout.addWidget(self.loopback_combo, 2, 1)
         
         # Sample Rate
-        layout.addWidget(QLabel("Sample Rate:"), 1, 0)
+        layout.addWidget(QLabel("Sample Rate:"), 3, 0)
         self.sample_rate = QSpinBox()
         self.sample_rate.setRange(8000, 48000)
         self.sample_rate.setValue(config.sample_rate)
-        layout.addWidget(self.sample_rate, 1, 1)
+        layout.addWidget(self.sample_rate, 3, 1)
 
         # Silence Threshold
-        layout.addWidget(QLabel("Silence Threshold:"), 2, 0)
+        layout.addWidget(QLabel("Silence Threshold:"), 4, 0)
         self.silence_thresh = QDoubleSpinBox()
         self.silence_thresh.setRange(0.001, 1.0)
         self.silence_thresh.setSingleStep(0.001)
         self.silence_thresh.setDecimals(3)
         self.silence_thresh.setValue(config.silence_threshold)
-        layout.addWidget(self.silence_thresh, 2, 1)
+        layout.addWidget(self.silence_thresh, 4, 1)
         
-        layout.addWidget(QLabel("Silence Duration (s):"), 3, 0)
+        layout.addWidget(QLabel("Sentence Pause (s):"), 5, 0)
         self.silence_dur = QDoubleSpinBox()
+        self.silence_dur.setRange(0.2, 2.0)
+        self.silence_dur.setSingleStep(0.1)
+        self.silence_dur.setDecimals(1)
         self.silence_dur.setValue(config.silence_duration)
-        layout.addWidget(self.silence_dur, 3, 1)
+        layout.addWidget(self.silence_dur, 5, 1)
+
+        layout.addWidget(QLabel("Capture Buffer (s):"), 6, 0)
+        self.capture_buffer_seconds = QDoubleSpinBox()
+        self.capture_buffer_seconds.setRange(2.0, 30.0)
+        self.capture_buffer_seconds.setSingleStep(1.0)
+        self.capture_buffer_seconds.setValue(config.capture_buffer_seconds)
+        layout.addWidget(self.capture_buffer_seconds, 6, 1)
         
-        layout.setRowStretch(4, 1) # Push to top
+        self.refresh_audio_inputs()
+        self._on_input_mode_changed()
+
+        layout.setRowStretch(7, 1) # Push to top
         
         tab.setLayout(layout)
         self.tabs.addTab(tab, "🎤 Audio")
@@ -495,8 +689,12 @@ class Dashboard(QWidget):
             from openai import OpenAI
             import httpx
             
-            api_key = self.api_key.text() or "dummy-key-for-local"
-            base_url = self.base_url.text() or None
+            api_key = (
+                self.api_key.text().strip()
+                or os.getenv(config.api_key_env)
+                or "dummy-key-for-local"
+            )
+            base_url = self.base_url.text().strip() or None
             
             # Update button state
             self.refresh_models_btn.setEnabled(False)
@@ -683,13 +881,13 @@ class Dashboard(QWidget):
         tab = QWidget()
         layout = QFormLayout()
         
-        self.api_key = QLineEdit(config.api_key)
+        self.api_key = QLineEdit("")
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key.setPlaceholderText("sk-...")
+        self.api_key.setPlaceholderText(f"Leave blank to use {config.api_key_env}")
         layout.addRow("API Key:", self.api_key)
         
         self.base_url = QLineEdit(config.api_base_url or "")
-        self.base_url.setPlaceholderText("https://api.openai.com/v1")
+        self.base_url.setPlaceholderText("https://api.deepseek.com")
         layout.addRow("Base URL:", self.base_url)
         
         # Model selection with refresh button
@@ -708,13 +906,80 @@ class Dashboard(QWidget):
         layout.addRow("Model:", model_layout)
         
         self.target_lang = QComboBox()
-        self.target_lang.addItems(["Chinese", "English", "Japanese", "French", "Spanish", "German", "Korean"])
+        self.target_lang.addItems(["zh-CN", "Chinese", "English", "Japanese", "French", "Spanish", "German", "Korean"])
         self.target_lang.setEditable(True)
         self.target_lang.setCurrentText(config.target_lang)
         layout.addRow("Target Language:", self.target_lang)
         
         tab.setLayout(layout)
         self.tabs.addTab(tab, "🈵 Translation")
+
+    def init_display_tab(self):
+        tab = QWidget()
+        layout = QFormLayout()
+
+        self.overlay_position = QComboBox()
+        self.overlay_position.addItem("Bottom Center", "bottom_center")
+        self.overlay_position.addItem("Bottom Left", "bottom_left")
+        self.overlay_position.addItem("Bottom Right", "bottom_right")
+        position_index = self.overlay_position.findData(config.overlay_position)
+        self.overlay_position.setCurrentIndex(position_index if position_index >= 0 else 0)
+        layout.addRow("Position:", self.overlay_position)
+
+        self.overlay_width = QSpinBox()
+        self.overlay_width.setRange(480, 2000)
+        self.overlay_width.setSingleStep(20)
+        self.overlay_width.setValue(config.window_width)
+        layout.addRow("Window Width:", self.overlay_width)
+
+        self.overlay_height = QSpinBox()
+        self.overlay_height.setRange(220, 1000)
+        self.overlay_height.setSingleStep(20)
+        self.overlay_height.setValue(config.window_height)
+        layout.addRow("Window Height:", self.overlay_height)
+
+        self.visible_items = QSpinBox()
+        self.visible_items.setRange(1, 6)
+        self.visible_items.setValue(config.max_visible_items)
+        layout.addRow("Subtitle Groups:", self.visible_items)
+
+        self.original_font_size = QSpinBox()
+        self.original_font_size.setRange(11, 30)
+        self.original_font_size.setValue(config.original_font_size)
+        layout.addRow("Original Font Size:", self.original_font_size)
+
+        self.translation_font_size = QSpinBox()
+        self.translation_font_size.setRange(14, 42)
+        self.translation_font_size.setValue(config.translation_font_size)
+        layout.addRow("Translation Font Size:", self.translation_font_size)
+
+        opacity_row = QWidget()
+        opacity_layout = QHBoxLayout(opacity_row)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_opacity = QSlider(Qt.Orientation.Horizontal)
+        self.panel_opacity.setRange(35, 230)
+        self.panel_opacity.setValue(config.panel_opacity)
+        self.panel_opacity_value = QLabel(str(config.panel_opacity))
+        self.panel_opacity_value.setFixedWidth(32)
+        self.panel_opacity.valueChanged.connect(
+            lambda value: self.panel_opacity_value.setText(str(value))
+        )
+        opacity_layout.addWidget(self.panel_opacity)
+        opacity_layout.addWidget(self.panel_opacity_value)
+        layout.addRow("Panel Opacity:", opacity_row)
+
+        self.overlay_bottom_margin = QSpinBox()
+        self.overlay_bottom_margin.setRange(0, 300)
+        self.overlay_bottom_margin.setSingleStep(4)
+        self.overlay_bottom_margin.setValue(config.overlay_bottom_margin)
+        layout.addRow("Bottom Margin:", self.overlay_bottom_margin)
+
+        self.auto_hide_controls = QCheckBox()
+        self.auto_hide_controls.setChecked(config.auto_hide_controls)
+        layout.addRow("Auto-hide Controls:", self.auto_hide_controls)
+
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "Display")
 
     def populate_devices(self):
         self.device_combo.clear()
@@ -735,6 +1000,36 @@ class Dashboard(QWidget):
         except Exception as e:
             self.device_combo.addItem(f"Error: {e}")
 
+    def populate_loopbacks(self):
+        self.loopback_combo.clear()
+        self.loopback_combo.addItem("Auto (Default Speaker)", "auto")
+
+        try:
+            import soundcard as sc
+            loopbacks = [
+                device for device in sc.all_microphones(include_loopback=True)
+                if getattr(device, "isloopback", False)
+            ]
+            for i, device in enumerate(loopbacks):
+                self.loopback_combo.addItem(f"[{i}] {device.name}", i)
+
+            if config.loopback_index is not None:
+                index = self.loopback_combo.findData(config.loopback_index)
+                if index >= 0:
+                    self.loopback_combo.setCurrentIndex(index)
+        except Exception as e:
+            self.loopback_combo.addItem(f"Error: {e}", "auto")
+
+    def refresh_audio_inputs(self):
+        self.populate_devices()
+        self.populate_loopbacks()
+        self._on_input_mode_changed()
+
+    def _on_input_mode_changed(self):
+        is_system = self.input_mode.currentData() == "system"
+        self.device_combo.setEnabled(not is_system)
+        self.loopback_combo.setEnabled(is_system)
+
     def save_config(self):
         import configparser
         import os
@@ -750,13 +1045,21 @@ class Dashboard(QWidget):
         if not cp.has_section("api"): cp.add_section("api")
         if not cp.has_section("translation"): cp.add_section("translation")
         if not cp.has_section("transcription"): cp.add_section("transcription")
+        if not cp.has_section("display"): cp.add_section("display")
         
         # Audio
+        cp.set("audio", "input_mode", self.input_mode.currentData() or "microphone")
         idx = self.device_combo.currentData()
         cp.set("audio", "device_index", str(idx) if idx is not None else "auto")
+        loopback_idx = self.loopback_combo.currentData()
+        cp.set("audio", "loopback_index", str(loopback_idx) if isinstance(loopback_idx, int) else "auto")
         cp.set("audio", "sample_rate", str(self.sample_rate.value()))
         cp.set("audio", "silence_threshold", str(self.silence_thresh.value()))
         cp.set("audio", "silence_duration", str(self.silence_dur.value()))
+        cp.set("audio", "partial_transcription", str(config.partial_transcription).lower())
+        cp.set("audio", "max_partial_duration", str(config.max_partial_duration))
+        cp.set("audio", "final_overlap_duration", str(config.final_overlap_duration))
+        cp.set("audio", "capture_buffer_seconds", str(self.capture_buffer_seconds.value()))
         
         # Transcription
         cp.set("transcription", "backend", self.asr_backend.currentText())
@@ -767,20 +1070,42 @@ class Dashboard(QWidget):
         cp.set("transcription", "source_language", self.source_language.currentText())
         
         # Translation
-        cp.set("api", "api_key", self.api_key.text())
-        cp.set("api", "base_url", self.base_url.text())
-        cp.set("translation", "model", self.model.currentText())
-        cp.set("translation", "target_lang", self.target_lang.currentText())
+        cp.set("api", "api_key", "")
+        cp.set("api", "base_url", "")
+        cp.set("translation", "provider", "deepseek")
+        cp.set("translation", "api_key_env", "DEEPSEEK_API_KEY")
+        cp.set("translation", "base_url", self.base_url.text().strip() or "https://api.deepseek.com")
+        cp.set("translation", "model", self.model.currentText().strip() or "deepseek-v4-flash")
+        cp.set("translation", "target_lang", self.target_lang.currentText().strip() or "zh-CN")
+        cp.set("translation", "disable_thinking", "true")
+
+        # Display
+        cp.set("display", "position", self.overlay_position.currentData() or "bottom_center")
+        cp.set("display", "window_width", str(self.overlay_width.value()))
+        cp.set("display", "window_height", str(self.overlay_height.value()))
+        cp.set("display", "max_visible_items", str(self.visible_items.value()))
+        cp.set("display", "original_font_size", str(self.original_font_size.value()))
+        cp.set("display", "translation_font_size", str(self.translation_font_size.value()))
+        cp.set("display", "panel_opacity", str(self.panel_opacity.value()))
+        cp.set("display", "bottom_margin", str(self.overlay_bottom_margin.value()))
+        cp.set("display", "auto_hide_controls", str(self.auto_hide_controls.isChecked()).lower())
         
         with open(config_path, 'w') as f:
             cp.write(f)
             
         self.status_label.setText("Saved! Please restart.")
+        self.runtime_detail_label.setText("Settings saved to config.ini")
 
     def on_start(self):
+        if self.pipeline is not None or self._startup_in_progress:
+            return
+
         # 1. Update UI to Loading State
+        self._startup_in_progress = True
+        self._update_tray_actions(running=False, loading=True)
         self.status_label.setText("Initializing Pipeline... (This may take a moment)")
         self.status_label.setStyleSheet("font-size: 18px; color: #fab387;") # Orange for loading
+        self.runtime_detail_label.setText("Loading ASR and translator")
         self.start_btn.setEnabled(False)
         self.start_btn.setText("Loading...")
         
@@ -794,51 +1119,85 @@ class Dashboard(QWidget):
         # Create Window on Main Thread
         from main import OverlayWindow
         from config import config
+
+        self._startup_in_progress = False
+        if self._quit_when_ready:
+             self._final_exit()
+             return
         
         if not pipeline:
              self.status_label.setText("Initialization Failed Check Console")
+             self.runtime_detail_label.setText("Startup failed")
              self.start_btn.setEnabled(True)
              self.start_btn.setText("▶ Launch Translator")
+             self._update_tray_actions(running=False, loading=False)
+             self.show_dashboard()
              return
 
         self.pipeline = pipeline
         self.overlay_window = OverlayWindow(
             display_duration=config.display_duration,
-            window_width=config.window_width
+            window_width=config.window_width,
+            window_height=config.window_height,
+            max_visible_items=config.max_visible_items,
+            bottom_margin=config.overlay_bottom_margin,
+            position=config.overlay_position,
+            original_font_size=config.original_font_size,
+            translation_font_size=config.translation_font_size,
+            panel_opacity=config.panel_opacity,
+            auto_hide_controls=config.auto_hide_controls,
         )
         self.overlay_window.show()
 
         # Connect Signals
         self.pipeline.signals.update_text.connect(self.overlay_window.update_text)
+        if hasattr(self.pipeline.signals, 'status'):
+             self.pipeline.signals.status.connect(self.set_runtime_status)
         if hasattr(self.overlay_window, 'stop_requested'):
              self.overlay_window.stop_requested.connect(self.on_stop)
+        if hasattr(self.overlay_window, 'size_persisted'):
+             self.overlay_window.size_persisted.connect(self._on_overlay_size_persisted)
 
         # Start Pipeline Thread
         self.pipeline.start()
 
-        self.status_label.setText("Running...")
-        self.status_label.setStyleSheet("font-size: 18px; color: #a6e3a1;")
+        self.set_runtime_status("running", "Running")
+        self._update_tray_actions(running=True, loading=False)
         
         self.start_btn.hide()
         self.stop_btn.show()
         
-        self.showMinimized()
+        if self.tray_icon:
+            self.hide()
+        else:
+            self.showMinimized()
+
+    def _on_overlay_size_persisted(self, width, height):
+        # Keep the Display tab in sync with a drag-resize of the overlay, so a
+        # later "Save Config" does not overwrite the size with stale values.
+        self.overlay_width.setValue(width)
+        self.overlay_height.setValue(height)
 
     def on_stop(self):
-        if hasattr(self, 'pipeline') and self.pipeline:
+        self._stop_pipeline(show_dashboard=True)
+
+    def _stop_pipeline(self, show_dashboard):
+        if self.pipeline:
             self.pipeline.stop()
             self.pipeline = None
             
-        if hasattr(self, 'overlay_window') and self.overlay_window:
+        if self.overlay_window:
             self.overlay_window.close()
             self.overlay_window = None
             
-        self.status_label.setText("Stopped")
+        self.set_runtime_status("stopped", "Stopped")
+        self._update_tray_actions(running=False, loading=self._startup_in_progress)
         self.stop_btn.hide()
         self.start_btn.show()
         self.start_btn.setEnabled(True)
         self.start_btn.setText("▶ Launch Translator")
-        self.showNormal()
+        if show_dashboard:
+            self.show_dashboard()
 
 class StartupWorker(QThread):
     finished = pyqtSignal(object, object) # window(None), pipeline
@@ -871,6 +1230,25 @@ if __name__ == "__main__":
     sys.excepthook = exception_hook
 
     app = QApplication(sys.argv)
+    # The native "windows11" style draws spin buttons in different places than
+    # the stylesheet's hit areas, leaving arrows that ignore clicks. Fusion
+    # renders and hit-tests consistently with stylesheets. The dark palette
+    # makes Fusion's native indicators (spin arrows, checkmarks) light-colored.
+    app.setStyle("Fusion")
+    from PyQt6.QtGui import QPalette, QColor
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#1e1e2e"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#cdd6f4"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#313244"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#45475a"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#cdd6f4"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#313244"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#cdd6f4"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#89b4fa"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#1e1e2e"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#313244"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#cdd6f4"))
+    app.setPalette(palette)
     w = Dashboard()
     w.show()
     sys.exit(app.exec())

@@ -1,5 +1,7 @@
 __pycache__
 transcripts
+logs
+test_outputs
 .DS_Store
 config.ini
 .venv

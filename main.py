@@ -15,22 +15,29 @@ from transcriber import Transcriber
 from translator import Translator
 from overlay_window import OverlayWindow
 from config import config
+from transcript_logger import TranscriptLogger
+from text_stabilizer import remove_repeated_prefix
+from speech_segmenter import get_segment_cut_reason
 
 class WorkerSignals(QObject):
     update_text = pyqtSignal(int, str, str)  # (chunk_id, original, translated)
+    status = pyqtSignal(str, str)  # (level, message)
 
 class Pipeline(QObject):
     def __init__(self):
         super().__init__()
         self.signals = WorkerSignals()
         self.running = True
+        self.transcript_logger = TranscriptLogger()
         
         # Print config for debugging
         config.print_config()
         
         # Initialize components
         self.audio = AudioCapture(
+            input_mode=config.audio_input_mode,
             device_index=config.device_index,
+            loopback_index=config.loopback_index,
             sample_rate=config.sample_rate,
             silence_threshold=config.silence_threshold,
             silence_duration=config.silence_duration,
@@ -39,7 +46,8 @@ class Pipeline(QObject):
             streaming_mode=config.streaming_mode,
             streaming_interval=config.streaming_interval,
             streaming_step_size=config.streaming_step_size,
-            streaming_overlap=config.streaming_overlap
+            streaming_overlap=config.streaming_overlap,
+            capture_buffer_seconds=config.capture_buffer_seconds,
         )
         
         # Initialize Transcriber
@@ -65,11 +73,15 @@ class Pipeline(QObject):
             target_lang=config.target_lang,
             base_url=config.api_base_url,
             api_key=config.api_key,
-            model=config.model
+            model=config.model,
+            provider=config.translation_provider,
+            api_key_env=config.api_key_env,
+            disable_thinking=config.translation_disable_thinking
         )
         
         # Warmup Transcriber (Critical for MLX/GPU)
         self.transcriber.warmup()
+        self.signals.status.emit("ready", "Pipeline ready")
 
     def start(self):
         """Start the processing pipeline in a dedicated thread"""
@@ -77,18 +89,22 @@ class Pipeline(QObject):
         self.thread = threading.Thread(target=self.processing_loop)
         self.thread.daemon = True
         self.thread.start()
+        self.signals.status.emit("running", "Listening")
 
     def stop(self):
         print("\n[Pipeline] Stopping...")
+        self.signals.status.emit("stopping", "Stopping")
         self.running = False
         self.audio.stop()
         if self.thread.is_alive():
             self.thread.join(timeout=2)
         print("[Pipeline] Stopped.")
+        self.signals.status.emit("stopped", "Stopped")
 
     def processing_loop(self):
         """Fully parallel pipeline: multiple concurrent transcription + translation"""
         print("Pipeline processing loop started (FULLY PARALLEL mode).")
+        self.signals.status.emit("running", "Capturing audio")
         
         # Create multiple transcribers for concurrent processing
         # CHECK: If using MLX, force 1 worker (MLX is not thread-safe for parallel inference in this way)
@@ -132,6 +148,8 @@ class Pipeline(QObject):
         chunk_id = 1
         last_update_time = time.time()
         phrase_start_time = time.time()
+        active_transcription_future = None
+        last_skipped_partial_log = 0.0
         
         # Generator yielding small chunks (e.g. 0.2s)
         audio_gen = self.audio.generator()
@@ -147,37 +165,14 @@ class Pipeline(QObject):
                 now = time.time()
                 buffer_duration = len(buffer) / self.audio.sample_rate
                 
-                # Check silence for finalization
-                # Use configured silence duration/threshold
-                is_silence = False
-                min_silence_dur = config.silence_duration # e.g. 1.0s
-                
-                # Only check silence if we have enough buffer
-                if buffer_duration > min_silence_dur:
-                     # Check tail of silence duration
-                    tail = buffer[-int(self.audio.sample_rate * min_silence_dur):]
-                    rms = np.sqrt(np.mean(tail**2))
-                    if rms < self.audio.silence_threshold:
-                        is_silence = True
-                        
-                # Dynamic VAD Logic
-                # 1. Standard: > 2.0s duration AND > 1.0s silence (Configured)
-                standard_cut = (is_silence and buffer_duration > 2.0)
-                
-                # 2. Soft Limit: > 6.0s duration AND > 0.4s silence (Catch brief pauses to avoid huge latency)
-                soft_limit_cut = False
-                if buffer_duration > 6.0:
-                    # Check shorter silence tail (0.4s)
-                    short_tail_samps = int(self.audio.sample_rate * 0.4)
-                    if len(buffer) > short_tail_samps:
-                        t_rms = np.sqrt(np.mean(buffer[-short_tail_samps:]**2))
-                        if t_rms < self.audio.silence_threshold:
-                            soft_limit_cut = True
-                            
-                # 3. Hard Limit: > max_phrase_duration (Force cut)
-                hard_limit_cut = (buffer_duration > self.audio.max_phrase_duration)
-
-                should_finalize = standard_cut or soft_limit_cut or hard_limit_cut
+                cut_reason = get_segment_cut_reason(
+                    buffer,
+                    self.audio.sample_rate,
+                    self.audio.silence_threshold,
+                    config.silence_duration,
+                    self.audio.max_phrase_duration,
+                )
+                should_finalize = cut_reason is not None
                 
                 if should_finalize and buffer_duration > 0.5:
                     # FINALIZE
@@ -190,15 +185,33 @@ class Pipeline(QObject):
                     # PRE-CHECK: Is the entire buffer actually silence?
                     # (Prevent infinite loop of repeating prompt on empty audio)
                     overall_rms = np.sqrt(np.mean(final_buffer**2))
+                    keep_overlap = False
                     if overall_rms < self.audio.silence_threshold:
                          print(f"[Pipeline] Skipped silent chunk {cid} (RMS={overall_rms:.4f})")
+                         self.signals.status.emit("running", "Waiting for speech")
                     else:
+                        keep_overlap = config.final_overlap_duration > 0
+                        print(
+                            f"[Pipeline] Finalizing chunk {cid} "
+                            f"(reason={cut_reason}, duration={buffer_duration:.1f}s)"
+                        )
                         # Submit Final Task
                         # Pass prompt AND translate_executor for async translation
-                        transcribe_executor.submit(self._process_final_chunk, final_buffer, cid, prompt, translate_executor)
+                        self.signals.status.emit("transcribing", "Finalizing speech")
+                        active_transcription_future = transcribe_executor.submit(
+                            self._process_final_chunk,
+                            final_buffer,
+                            cid,
+                            prompt,
+                            translate_executor,
+                        )
                     
                     # Reset
-                    buffer = np.array([], dtype=np.float32)
+                    overlap_samples = int(self.audio.sample_rate * config.final_overlap_duration)
+                    if keep_overlap and overlap_samples > 0 and len(final_buffer) > overlap_samples:
+                        buffer = final_buffer[-overlap_samples:].copy()
+                    else:
+                        buffer = np.array([], dtype=np.float32)
                     chunk_id += 1
                     phrase_start_time = now
                     last_update_time = now
@@ -208,16 +221,36 @@ class Pipeline(QObject):
                     # PARTIAL UPDATE
                     partial_buffer = buffer.copy()
                     prompt = self.last_final_text
+                    transcription_busy = (
+                        active_transcription_future is not None
+                        and not active_transcription_future.done()
+                    )
                     
                     # RMS Check to avoid partial hallucination on silence
                     rms = np.sqrt(np.mean(partial_buffer**2))
-                    if rms > self.audio.silence_threshold:
-                        transcribe_executor.submit(self._process_partial_chunk, partial_buffer, chunk_id, prompt)
+                    if not config.partial_transcription:
+                        pass
+                    elif transcription_busy:
+                        if now - last_skipped_partial_log > 3.0:
+                            print("[Pipeline] Skipping partial ASR while previous transcription is still running")
+                            self.signals.status.emit("transcribing", "ASR busy; waiting for final segment")
+                            last_skipped_partial_log = now
+                    elif buffer_duration > config.max_partial_duration:
+                        pass
+                    elif rms > self.audio.silence_threshold:
+                        self.signals.status.emit("transcribing", "Recognizing speech")
+                        active_transcription_future = transcribe_executor.submit(
+                            self._process_partial_chunk,
+                            partial_buffer,
+                            chunk_id,
+                            prompt,
+                        )
                     
                     last_update_time = now
                     
         except Exception as e:
             print(f"[Pipeline] Error in loop: {e}")
+            self.signals.status.emit("error", f"Pipeline error: {e}")
         finally:
             transcribe_executor.shutdown(wait=False)
             translate_executor.shutdown(wait=False)
@@ -237,13 +270,23 @@ class Pipeline(QObject):
         try:
             text = self.transcriber.transcribe(audio_data, prompt=prompt)
             if text:
+                deduped_text = remove_repeated_prefix(text, self.last_final_text)
+                if deduped_text != text:
+                    print(f"[Final {chunk_id}] Removed overlapped prefix: {text} -> {deduped_text}")
+                    text = deduped_text
+                if not text:
+                    print(f"[Final {chunk_id}] Skipped duplicate overlap")
+                    return
+
                 print(f"[Final {chunk_id}] Transcribed: {text}")
+                self.transcript_logger.record(chunk_id, original=text, status="transcribed")
+                self.signals.status.emit("translating", "Translating")
                 # Save for context (only if meaningful)
                 if len(text.split()) > 2:
                     self.last_final_text = text
                 
-                # Emit final transcription first (confirms text)
-                self.signals.update_text.emit(chunk_id, text, "(translating...)")
+                # Show stable source text immediately; translation arrives separately.
+                self.signals.update_text.emit(chunk_id, text, "")
                 
                 # Offload translation to separate thread so we don't block next transcription
                 if translate_executor:
@@ -258,9 +301,24 @@ class Pipeline(QObject):
         try:
             translated = self.translator.translate(text)
             print(f"[Final {chunk_id}] Translated: {translated}")
+            self.transcript_logger.record(
+                chunk_id,
+                original=text,
+                translated=translated,
+                status="translated",
+            )
+            self.signals.status.emit("running", "Listening")
             self.signals.update_text.emit(chunk_id, text, translated)
         except Exception as e:
             print(f"[Translation {chunk_id}] Failed: {e}")
+            self.transcript_logger.record(
+                chunk_id,
+                original=text,
+                translated="",
+                status="translation_failed",
+                error=e,
+            )
+            self.signals.status.emit("error", f"Translation failed: {e}")
             self.signals.update_text.emit(chunk_id, text, "[Translation Failed]")
     
     def _transcribe_chunk(self, transcriber, audio_chunk, chunk_id):
@@ -295,7 +353,15 @@ def start_overlay_session():
     # Initialize Overlay Window
     window = OverlayWindow(
         display_duration=config.display_duration,
-        window_width=config.window_width
+        window_width=config.window_width,
+        window_height=config.window_height,
+        max_visible_items=config.max_visible_items,
+        bottom_margin=config.overlay_bottom_margin,
+        position=config.overlay_position,
+        original_font_size=config.original_font_size,
+        translation_font_size=config.translation_font_size,
+        panel_opacity=config.panel_opacity,
+        auto_hide_controls=config.auto_hide_controls,
     )
     window.show()
     
